@@ -170,7 +170,7 @@ try {
     _ok "Rollback complete."
     _info "Next steps:"
     _info "  1. Re run the PowerSyncPro migration for this device or user."
-    _info "  2. Attempt login again with the SourceSid account [$SourceSid]."
+    _info "  2. Attempt login again with the affected user account / profile."
     _info "Transcript log saved to: $logFile"
 }
 catch {
