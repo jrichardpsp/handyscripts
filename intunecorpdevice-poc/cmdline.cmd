@@ -1,0 +1,1 @@
+start /WAIT "" "C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe" -ExecutionPolicy Bypass -File .\Set-CorporateDeviceIdentifiers.ps1
