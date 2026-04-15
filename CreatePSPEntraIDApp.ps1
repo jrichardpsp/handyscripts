@@ -563,12 +563,24 @@ if (-not $currentContext) {
     Info "Connecting to tenant '$TenantID' ($CloudEnvironment)..."
     Info "A device login prompt will appear below. Complete authentication in your browser."
     Write-Host ""
-    Connect-MgGraph -ClientId $graphCliClientId `
-                    -Scopes $requiredScopes `
-                    -TenantId $TenantID `
-                    -Environment $mgEnvironment `
-                    -UseDeviceAuthentication `
-                    -NoWelcome
+
+    # The commercial Graph CLI client ID (14d82eec-...) is not registered in government
+    # cloud tenants. For GCC High / DoD, omit -ClientId so the Graph module uses its
+    # built-in government cloud client app instead.
+    if ($CloudEnvironment -eq "Commercial") {
+        Connect-MgGraph -ClientId $graphCliClientId `
+                        -Scopes $requiredScopes `
+                        -TenantId $TenantID `
+                        -Environment $mgEnvironment `
+                        -UseDeviceAuthentication `
+                        -NoWelcome
+    } else {
+        Connect-MgGraph -Scopes $requiredScopes `
+                        -TenantId $TenantID `
+                        -Environment $mgEnvironment `
+                        -UseDeviceAuthentication `
+                        -NoWelcome
+    }
 }
 
 $context = Get-MgContext
