@@ -89,7 +89,8 @@
     Updated:    13th April 2026 - Removed Directory.Read.All from DirSyncRO and DirSyncHP
                                   profiles; not required by default.
     Updated:    15th April 2026 - Added -CloudEnvironment parameter for GCC High and DoD
-                                  support; passes -Environment to Connect-MgGraph.
+                                  support; REST-based device code flow for government clouds
+                                  to bypass Azure.Identity token caching bug.
 #>
 
 param(
@@ -381,6 +382,67 @@ function Grant-AppRoleConsent {
 }
 
 # ---------------------------------------------------------------------------
+# Government Cloud Authentication
+# The Microsoft.Graph module's DeviceCodeCredential (Azure.Identity) does not
+# reliably cache tokens for USGov / USGovDoD environments, causing every Graph
+# cmdlet to fail with "DeviceCodeCredential authentication failed" even after a
+# successful initial login.  We work around this by running the device code flow
+# ourselves via REST and handing the resulting access token to Connect-MgGraph,
+# bypassing Azure.Identity entirely.
+# ---------------------------------------------------------------------------
+
+function Invoke-GovernmentDeviceCodeAuth {
+    param(
+        [string]   $TenantId,
+        [string]   $CloudEnvironment,
+        [string]   $ClientId,
+        [string[]] $Scopes
+    )
+
+    $loginHost = "https://login.microsoftonline.us"
+
+    $graphResource = switch ($CloudEnvironment) {
+        "DoD"  { "https://dod-graph.microsoft.us" }
+        default { "https://graph.microsoft.us"    }
+    }
+
+    $scopeString = ($Scopes | ForEach-Object { "$graphResource/$_" }) -join " "
+
+    # Initiate device code flow
+    $dcResponse = Invoke-RestMethod -Method POST `
+        -Uri         "$loginHost/$TenantId/oauth2/v2.0/devicecode" `
+        -Body        "client_id=$ClientId&scope=$([Uri]::EscapeDataString($scopeString))" `
+        -ContentType "application/x-www-form-urlencoded"
+
+    Write-Host $dcResponse.message
+    Write-Host ""
+
+    # Poll until the user completes auth or the code expires
+    $expires  = (Get-Date).AddSeconds([int]$dcResponse.expires_in)
+    $interval = [int]$dcResponse.interval
+
+    while ((Get-Date) -lt $expires) {
+        Start-Sleep -Seconds $interval
+        try {
+            $tokenResponse = Invoke-RestMethod -Method POST `
+                -Uri         "$loginHost/$TenantId/oauth2/v2.0/token" `
+                -Body        "client_id=$ClientId&device_code=$($dcResponse.device_code)&grant_type=urn:ietf:params:oauth:grant-type:device_code" `
+                -ContentType "application/x-www-form-urlencoded"
+            return $tokenResponse
+        } catch {
+            $errBody = $null
+            try { $errBody = ($_.ErrorDetails.Message | ConvertFrom-Json) } catch {}
+            $errCode = if ($errBody) { $errBody.error } else { "" }
+            if ($errCode -eq "authorization_pending") { continue }
+            if ($errCode -eq "slow_down")             { $interval += 5; continue }
+            throw
+        }
+    }
+
+    throw "Authentication timed out. Please re-run the script."
+}
+
+# ---------------------------------------------------------------------------
 # Interactive Interview
 # Asks two questions to determine the correct permission set.
 # Not called when -PermissionSet is provided.
@@ -564,9 +626,6 @@ if (-not $currentContext) {
     Info "A device login prompt will appear below. Complete authentication in your browser."
     Write-Host ""
 
-    # The commercial Graph CLI client ID (14d82eec-...) is not registered in government
-    # cloud tenants. For GCC High / DoD, omit -ClientId so the Graph module uses its
-    # built-in government cloud client app instead.
     if ($CloudEnvironment -eq "Commercial") {
         Connect-MgGraph -ClientId $graphCliClientId `
                         -Scopes $requiredScopes `
@@ -575,17 +634,29 @@ if (-not $currentContext) {
                         -UseDeviceAuthentication `
                         -NoWelcome
     } else {
-        Connect-MgGraph -Scopes $requiredScopes `
-                        -TenantId $TenantID `
+        # Azure.Identity's DeviceCodeCredential does not reliably cache tokens for
+        # government clouds, causing all subsequent Graph cmdlets to fail.  We obtain
+        # the token via REST instead and pass it directly to Connect-MgGraph.
+        $govToken    = Invoke-GovernmentDeviceCodeAuth `
+                           -TenantId         $TenantID `
+                           -CloudEnvironment $CloudEnvironment `
+                           -ClientId         $graphCliClientId `
+                           -Scopes           $requiredScopes
+        $secureToken = ConvertTo-SecureString $govToken.access_token -AsPlainText -Force
+        Connect-MgGraph -AccessToken $secureToken `
                         -Environment $mgEnvironment `
-                        -UseDeviceAuthentication `
                         -NoWelcome
     }
 }
 
 $context = Get-MgContext
 
-$missingScopes = $requiredScopes | Where-Object { $_ -notin $context.Scopes }
+# For government clouds authenticated via access token, scopes come back as the
+# full resource URI (e.g. "https://graph.microsoft.us/User.Read").  Normalise to
+# short names so the check below works the same way for all environments.
+$contextScopes = $context.Scopes | ForEach-Object { ($_ -split "/")[-1] }
+
+$missingScopes = $requiredScopes | Where-Object { $_ -notin $contextScopes }
 if ($missingScopes.Count -gt 0) {
     Write-Host ""
     Err "The following required permissions were not granted:"
