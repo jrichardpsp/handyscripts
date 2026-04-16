@@ -89,8 +89,9 @@
     Updated:    13th April 2026 - Removed Directory.Read.All from DirSyncRO and DirSyncHP
                                   profiles; not required by default.
     Updated:    15th April 2026 - Added -CloudEnvironment parameter for GCC High and DoD
-                                  support; REST-based device code flow for government clouds
-                                  to bypass Azure.Identity token caching bug.
+                                  support; REST-based device code flow for all environments
+                                  to bypass Azure.Identity token caching regression in
+                                  Microsoft.Graph module 2.36.x.
 #>
 
 param(
@@ -295,7 +296,11 @@ function Test-MicrosoftGraphModule {
 
 function Get-GraphAppRoleMap {
     Info "Loading Microsoft Graph application roles..."
-    $graphSp = Get-MgServicePrincipal -Filter "AppId eq '$graphAppId'"
+    try {
+        $graphSp = Get-MgServicePrincipal -Filter "AppId eq '$graphAppId'" -ErrorAction Stop
+    } catch {
+        throw "Failed to query Microsoft Graph service principal: $($_.Exception.Message)"
+    }
 
     if (-not $graphSp) {
         throw "Could not find Microsoft Graph service principal in this tenant."
@@ -337,13 +342,24 @@ function Ensure-ServicePrincipalExists {
         [Parameter(Mandatory = $false)] [string] $DisplayName
     )
 
-    $label    = if ($DisplayName) { $DisplayName } else { $AppId }
-    $existing = Get-MgServicePrincipal -All | Where-Object { $_.AppId -eq $AppId }
+    $label = if ($DisplayName) { $DisplayName } else { $AppId }
+
+    try {
+        $existing = Get-MgServicePrincipal -All -ErrorAction Stop | Where-Object { $_.AppId -eq $AppId }
+    } catch {
+        Err "Failed to query service principals: $($_.Exception.Message)"
+        exit 1
+    }
 
     if (-not $existing) {
         Info "Creating service principal: $label..."
-        New-MgServicePrincipal -AppId $AppId | Out-Null
-        Ok "$label created."
+        try {
+            New-MgServicePrincipal -AppId $AppId -ErrorAction Stop | Out-Null
+            Ok "$label created."
+        } catch {
+            Err "Failed to create service principal '$label': $($_.Exception.Message)"
+            exit 1
+        }
     } else {
         Ok "$label already present."
     }
@@ -382,16 +398,16 @@ function Grant-AppRoleConsent {
 }
 
 # ---------------------------------------------------------------------------
-# Government Cloud Authentication
-# The Microsoft.Graph module's DeviceCodeCredential (Azure.Identity) does not
-# reliably cache tokens for USGov / USGovDoD environments, causing every Graph
-# cmdlet to fail with "DeviceCodeCredential authentication failed" even after a
-# successful initial login.  We work around this by running the device code flow
-# ourselves via REST and handing the resulting access token to Connect-MgGraph,
-# bypassing Azure.Identity entirely.
+# Device Code Authentication (REST-based)
+# Microsoft.Graph module 2.36.x introduced a regression where DeviceCodeCredential
+# (Azure.Identity) fails to cache tokens, causing every Graph cmdlet to throw
+# "DeviceCodeCredential authentication failed" even after a successful login.
+# This affects Commercial and Government clouds alike.
+# We bypass Azure.Identity entirely by doing the device code flow via REST and
+# passing the resulting access token directly to Connect-MgGraph -AccessToken.
 # ---------------------------------------------------------------------------
 
-function Invoke-GovernmentDeviceCodeAuth {
+function Invoke-DeviceCodeAuth {
     param(
         [string]   $TenantId,
         [string]   $CloudEnvironment,
@@ -399,20 +415,34 @@ function Invoke-GovernmentDeviceCodeAuth {
         [string[]] $Scopes
     )
 
-    $loginHost = "https://login.microsoftonline.us"
+    $loginHost = switch ($CloudEnvironment) {
+        "GCCHigh" { "https://login.microsoftonline.us"  }
+        "DoD"     { "https://login.microsoftonline.us"  }
+        default   { "https://login.microsoftonline.com" }
+    }
 
     $graphResource = switch ($CloudEnvironment) {
-        "DoD"  { "https://dod-graph.microsoft.us" }
-        default { "https://graph.microsoft.us"    }
+        "GCCHigh" { "https://graph.microsoft.us"        }
+        "DoD"     { "https://dod-graph.microsoft.us"    }
+        default   { "https://graph.microsoft.com"       }
     }
 
     $scopeString = ($Scopes | ForEach-Object { "$graphResource/$_" }) -join " "
 
     # Initiate device code flow
-    $dcResponse = Invoke-RestMethod -Method POST `
-        -Uri         "$loginHost/$TenantId/oauth2/v2.0/devicecode" `
-        -Body        "client_id=$ClientId&scope=$([Uri]::EscapeDataString($scopeString))" `
-        -ContentType "application/x-www-form-urlencoded"
+    try {
+        $dcResponse = Invoke-RestMethod -Method POST `
+            -Uri         "$loginHost/$TenantId/oauth2/v2.0/devicecode" `
+            -Body        "client_id=$ClientId&scope=$([Uri]::EscapeDataString($scopeString))" `
+            -ContentType "application/x-www-form-urlencoded"
+    } catch {
+        $errBody = $null
+        try { $errBody = ($_.ErrorDetails.Message | ConvertFrom-Json) } catch {}
+        if ($errBody -and $errBody.error_description) {
+            throw "Authentication request failed: $($errBody.error_description)"
+        }
+        throw "Authentication request failed: $($_.Exception.Message)"
+    }
 
     Write-Host $dcResponse.message
     Write-Host ""
@@ -626,27 +656,15 @@ if (-not $currentContext) {
     Info "A device login prompt will appear below. Complete authentication in your browser."
     Write-Host ""
 
-    if ($CloudEnvironment -eq "Commercial") {
-        Connect-MgGraph -ClientId $graphCliClientId `
-                        -Scopes $requiredScopes `
-                        -TenantId $TenantID `
-                        -Environment $mgEnvironment `
-                        -UseDeviceAuthentication `
-                        -NoWelcome
-    } else {
-        # Azure.Identity's DeviceCodeCredential does not reliably cache tokens for
-        # government clouds, causing all subsequent Graph cmdlets to fail.  We obtain
-        # the token via REST instead and pass it directly to Connect-MgGraph.
-        $govToken    = Invoke-GovernmentDeviceCodeAuth `
-                           -TenantId         $TenantID `
-                           -CloudEnvironment $CloudEnvironment `
-                           -ClientId         $graphCliClientId `
-                           -Scopes           $requiredScopes
-        $secureToken = ConvertTo-SecureString $govToken.access_token -AsPlainText -Force
-        Connect-MgGraph -AccessToken $secureToken `
-                        -Environment $mgEnvironment `
-                        -NoWelcome
-    }
+    $token       = Invoke-DeviceCodeAuth `
+                       -TenantId         $TenantID `
+                       -CloudEnvironment $CloudEnvironment `
+                       -ClientId         $graphCliClientId `
+                       -Scopes           $requiredScopes
+    $secureToken = ConvertTo-SecureString $token.access_token -AsPlainText -Force
+    Connect-MgGraph -AccessToken $secureToken `
+                    -Environment $mgEnvironment `
+                    -NoWelcome
 }
 
 $context = Get-MgContext
@@ -670,24 +688,47 @@ Write-Host ""
 Ok "Connected as $($context.Account)"
 
 # ---------------------------------------------------------------------------
+# Connection Validation
+# Verify the session can actually reach the tenant before proceeding.
+# ---------------------------------------------------------------------------
+
+try {
+    $null = Get-MgOrganization -ErrorAction Stop
+} catch {
+    Err "Connected but unable to query the tenant. The tenant ID may be incorrect,"
+    Err "or the account may not have access."
+    Err $_.Exception.Message
+    exit 1
+}
+
+# ---------------------------------------------------------------------------
 # BPRT Federation Check
 # Only relevant for permission sets that include the BPRT permission.
 # ---------------------------------------------------------------------------
 
 $isFederated = $false
 if ($selectedSet.IncludeBprt) {
-    $user       = Get-MgUser -UserId $context.Account
-    $domain     = $user.UserPrincipalName.Split("@")[1]
-    $domainInfo = Get-MgDomain -DomainId $domain
-
-    if ($domainInfo.AuthenticationType -eq "Federated") {
-        $isFederated = $true
-        Warn "This account is federated."
-        Warn "The app registration will be created successfully, but if you plan to"
-        Warn "create a Bulk Enrolment Token (BPRT) later, you will need to use a"
-        Warn "non-federated Global Admin account at that point."
+    if ([string]::IsNullOrWhiteSpace($context.Account)) {
+        Warn "Could not determine the signed-in account. Skipping federation check."
     } else {
-        Ok "This account is not federated."
+        try {
+            $user       = Get-MgUser -UserId $context.Account -ErrorAction Stop
+            $domain     = $user.UserPrincipalName.Split("@")[1]
+            $domainInfo = Get-MgDomain -DomainId $domain -ErrorAction Stop
+
+            if ($domainInfo.AuthenticationType -eq "Federated") {
+                $isFederated = $true
+                Warn "This account is federated."
+                Warn "The app registration will be created successfully, but if you plan to"
+                Warn "create a Bulk Enrolment Token (BPRT) later, you will need to use a"
+                Warn "non-federated Global Admin account at that point."
+            } else {
+                Ok "This account is not federated."
+            }
+        } catch {
+            Warn "Federation check failed: $($_.Exception.Message)"
+            Warn "Proceeding without federation status."
+        }
     }
 }
 
