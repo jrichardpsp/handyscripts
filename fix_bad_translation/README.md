@@ -18,6 +18,55 @@ This script is for situations where a user was incorrectly mapped to the wrong t
 
 You must also **run this script as a local administrator that is not one of the affected users** — for example, the PSP Fallback Account. Do not run it while logged in as the Source, Target, or Bad SID user.
 
+## How you got here
+
+```mermaid
+flowchart TD
+    A["Source AD user: jsmith<br/>SID: SourceSID"] --> B
+
+    B["Admin creates translation table in PowerSyncPro"]
+    B -->|Correct mapping| C["SourceSID → TargetSID"]
+    B -->|Actual mapping| D["SourceSID → BadSID !!"]
+
+    D --> E["Migration Agent runs on workstation<br/>Reads the bad translation table"]
+    E --> F["Agent renames ProfileList registry key:<br/>SourceSID → BadSID<br/>Profile folder unchanged: C:\Users\jsmith"]
+
+    F --> G["User logs in with TargetSID credentials<br/>Windows looks for a profile with TargetSID — none found"]
+    G --> H["Windows creates a fresh temporary profile<br/>for TargetSID"]
+
+    H --> I(["Problem State<br/><br/>Registry: BadSID → C:\Users\jsmith (real profile, wrong key)<br/>Registry: TargetSID → C:\Users\jsmith.corp (empty temp profile)<br/><br/>User cannot access their real profile"])
+
+    style D fill:#b00,color:#fff
+    style I fill:#600,color:#fff
+    style C fill:#060,color:#fff
+```
+
+## How the script fixes it
+
+```mermaid
+flowchart TD
+    PRE(["Prerequisite<br/>Fix the translation table in the<br/>PowerSyncPro Admin Panel before running"])
+
+    PRE --> B
+
+    subgraph script["PSP-FixBadTranslation.ps1"]
+        B["Rename ProfileList registry key:<br/>BadSID → SourceSID<br/>Update binary SID value in registry"]
+        C["Rename temp TargetSID profile folder → .bak<br/>Rename TargetSID registry key → .bak"]
+        D["Stop PowerSyncPro Migration Agent service"]
+        E["Clear Migration Agent data folder"]
+        F["Write new TranslationTable.json:<br/>SourceSID → TargetSID<br/>BadSID → TargetSID"]
+        G["Start PowerSyncPro Migration Agent service"]
+        B --> C --> D --> E --> F --> G
+    end
+
+    G --> H["Admin re-runs the PowerSyncPro migration"]
+    H --> I["Agent reads corrected translation table<br/>Finds SourceSID profile<br/>Re-permissions profile to TargetSID"]
+    I --> J(["Result<br/><br/>User logs in with TargetSID<br/>Gets their real profile C:\Users\jsmith<br/>Correctly permissioned"])
+
+    style PRE fill:#b06000,color:#fff
+    style J fill:#060,color:#fff
+```
+
 ## What the script does
 
 1. Validates SID formats for all provided SIDs.
