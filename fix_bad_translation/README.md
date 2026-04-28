@@ -39,9 +39,9 @@ After the script completes, re-run the PowerSyncPro migration. The agent will re
 |---|---|---|
 | `-SourceSid` | Yes | The original (pre-migration) SID for the affected user. |
 | `-TargetSid` | Yes | The correct target SID the user should be translated to. |
-| `-BadSid` | No* | The incorrect SID the profile was mistakenly translated to. |
-| `-ProfilePath` | No* | Path to the user's profile folder (e.g. `C:\Users\jsmith`). Used to look up the Bad SID if `-BadSid` is not provided. |
-| `-RunbookGuid` | No | The GUID of the Migration Agent runbook to recreate. Auto-discovered if only one runbook exists. |
+| `-BadSid` | No* | The incorrect SID the profile was mistakenly translated to. If omitted, provide `-ProfilePath` and the script will look it up automatically. |
+| `-ProfilePath` | No* | Path to the user's profile folder (e.g. `C:\Users\jsmith`). The script will find the Bad SID by searching the registry for a profile pointing to this path. |
+| `-RunbookGuid` | No | The GUID of the Migration Agent runbook to recreate. The script will find this automatically from the existing install — only provide it manually if the script cannot determine it. |
 
 *Either `-BadSid` or `-ProfilePath` must be supplied.
 
@@ -53,9 +53,25 @@ SIDs for all three values can be found in the PowerSyncPro translation table:
 https://<PSP Server URL>/migrationAgent/CheckTranslationEntries
 ```
 
+## Finding the Bad SID
+
+In most cases you do not need to find the Bad SID yourself. Provide `-ProfilePath` (e.g. `C:\Users\jsmith`) and the script will search the registry for a `ProfileList` entry pointing to that folder and extract the Bad SID automatically.
+
+If you do need to find it manually, it will appear as an unrecognized SID under:
+```
+HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList
+```
+Look for a key whose `ProfileImagePath` value points to the affected user's profile folder.
+
 ## Finding the Runbook GUID
 
-The Runbook GUID can be found via Developer Tools in a Chromium-based browser (Chrome, Edge, Brave, Opera, etc.):
+In most cases you do not need to provide this. The script will look for the runbook in the existing Migration Agent install at:
+```
+%ProgramData%\Declaration Software\Migration Agent\<runbook guid>\
+```
+It will match the correct runbook by checking the `TranslationTable.json` inside each folder for the expected Source → Bad SID mapping. If it finds exactly one match, it uses it automatically. You will only be prompted if it cannot determine the correct GUID on its own.
+
+If you do need to look it up manually, use Developer Tools in a Chromium-based browser (Chrome, Edge, Brave, Opera, etc.):
 
 1. Open the **Runbooks** page in the PowerSyncPro Web Admin Panel.
 2. Press `F12` to open Developer Tools (or `Ctrl+Shift+I`).
