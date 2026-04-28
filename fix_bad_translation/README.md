@@ -85,7 +85,18 @@ If you do need to look it up manually, use Developer Tools in a Chromium-based b
 
 ## Example commands
 
-### All parameters provided explicitly
+### Minimal — all optional values auto-resolved
+
+The Bad SID is looked up from the profile path and the Runbook GUID is discovered from the existing install.
+
+```powershell
+.\PSP-FixBadTranslation.ps1 `
+    -SourceSid   "S-1-5-21-3214081272-1437970042-2533267026-1111" `
+    -TargetSid   "S-1-12-1-3174294469-1095778936-2869651892-298814751" `
+    -ProfilePath "C:\Users\jsmith"
+```
+
+### Bad SID and Runbook GUID provided explicitly
 
 ```powershell
 .\PSP-FixBadTranslation.ps1 `
@@ -95,9 +106,7 @@ If you do need to look it up manually, use Developer Tools in a Chromium-based b
     -RunbookGuid "df0a0278-9d4a-4c96-32dc-08de15914463"
 ```
 
-### Bad SID looked up from the user's profile path
-
-Use this when you know the profile folder but not the Bad SID. The script will search the registry for a `ProfileList` key whose `ProfileImagePath` matches the provided path.
+### Bad SID looked up from profile path, Runbook GUID provided explicitly
 
 ```powershell
 .\PSP-FixBadTranslation.ps1 `
@@ -107,24 +116,13 @@ Use this when you know the profile folder but not the Bad SID. The script will s
     -RunbookGuid "df0a0278-9d4a-4c96-32dc-08de15914463"
 ```
 
-### Runbook GUID auto-discovered
-
-If only one runbook folder exists in the Migration Agent data directory, the GUID will be detected automatically.
+### Bad SID provided explicitly, Runbook GUID auto-discovered
 
 ```powershell
 .\PSP-FixBadTranslation.ps1 `
     -SourceSid   "S-1-5-21-3214081272-1437970042-2533267026-1111" `
     -TargetSid   "S-1-12-1-3174294469-1095778936-2869651892-298814751" `
     -BadSid      "S-1-12-1-856125190-1258027666-1451343766-332335133"
-```
-
-### Minimal — all optional values auto-resolved
-
-```powershell
-.\PSP-FixBadTranslation.ps1 `
-    -SourceSid   "S-1-5-21-3214081272-1437970042-2533267026-1111" `
-    -TargetSid   "S-1-12-1-3174294469-1095778936-2869651892-298814751" `
-    -ProfilePath "C:\Users\jsmith"
 ```
 
 ## Output
@@ -139,3 +137,4 @@ C:\Temp\PSP-FixBadTranslation-<yyyyMMdd_HHmmss>.log
 - PowerShell 5.1 or later
 - Must be run as a local Administrator
 - Must **not** be run as any of the affected user accounts (Source, Target, or Bad SID)
+- The correct Source and Target SIDs must be confirmed in the PowerSyncPro translation table before running — incorrect SIDs will result in a broken profile mapping
