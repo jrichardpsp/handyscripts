@@ -2,6 +2,8 @@
 
 Performs a complete removal of the SCCM (Configuration Manager) client from a Windows machine, using the official uninstaller with full manual fallback cleanup.
 
+> **Disclaimer:** This script is provided **as-is, with no warranty of any kind**, express or implied. It is a community-driven resource maintained for and by users of [Declaration Software](https://declarationsoftware.com) / [PowerSyncPro](https://powersyncpro.com). Use at your own risk. Neither Declaration Software nor PowerSyncPro assumes any liability for damages resulting from the use or misuse of this script.
+
 ---
 
 ## The Problem
@@ -81,3 +83,4 @@ Can be deployed as:
 
 - Safe to run on machines where the SCCM client is already partially or fully removed -- each step checks for existence before acting.
 - Re-running on a clean machine is a no-op.
+

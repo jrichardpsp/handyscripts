@@ -27,6 +27,12 @@
     Tested on: Windows 10 / 11, SCCM Client / ConfigMgr Client (all modern versions).
     Use-case:  Pre-migration cleanup before Entra ID join or OS re-imaging.
 
+    DISCLAIMER: This script is provided AS-IS, with NO WARRANTY of any kind, express
+    or implied. It is a community-driven resource maintained for and by users of
+    Declaration Software / PowerSyncPro. Use at your own risk. Neither Declaration
+    Software nor PowerSyncPro assumes any liability for damages resulting from the
+    use or misuse of this script.
+
 .EXAMPLE
     .\sccm_removal.ps1
 
