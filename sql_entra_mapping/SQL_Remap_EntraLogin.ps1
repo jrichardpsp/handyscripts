@@ -415,6 +415,25 @@ WHERE m.name = N'$litUser' ORDER BY r.name;
     Write-Ok ("Owned databases: " + ($(if ($ownedDbs) { $ownedDbs -join ', ' } else { '(none)' })))
 
     # -----------------------------------------------------------------------
+    # 4b. SQL Agent jobs owned by the login (must be reassigned before DROP LOGIN)
+    # -----------------------------------------------------------------------
+    Write-Step "Finding SQL Agent jobs owned by '$LoginName'"
+    $ownedJobs = @()
+    try {
+        $ownedJobs = @(Invoke-Sql -Query @"
+SELECT CONVERT(varchar(36), j.job_id) AS job_id, j.name AS job_name
+FROM msdb.dbo.sysjobs j
+JOIN sys.server_principals sp ON j.owner_sid = sp.sid
+WHERE sp.name = N'$litLogin'
+ORDER BY j.name;
+"@)
+    }
+    catch {
+        Write-Warn2 "Could not query SQL Agent jobs (Agent may be disabled or not installed): $($_.Exception.Message)"
+    }
+    Write-Ok ("Owned Agent jobs: " + ($(if ($ownedJobs) { ($ownedJobs | ForEach-Object { $_.job_name }) -join ', ' } else { '(none)' })))
+
+    # -----------------------------------------------------------------------
     # 5. Build the recreate / restore / re-link T-SQL
     # -----------------------------------------------------------------------
     $createStmt = "CREATE LOGIN $qLogin FROM WINDOWS WITH DEFAULT_DATABASE=[$(Esc-Ident $defaultDb)]"
@@ -456,6 +475,7 @@ WHERE m.name = N'$litUser' ORDER BY r.name;
         ServerPermissions = ($perms | ForEach-Object { "$($_.state_desc) $($_.permission_name)" })
         MappedUsers       = $mappedUsers
         OwnedDatabases    = $ownedDbs
+        OwnedJobs         = ($ownedJobs | ForEach-Object { [PSCustomObject]@{ JobId = $_.job_id; JobName = $_.job_name } })
         ScannedDatabases  = $dbList
         ScanSkipped       = $scanSkipped
         HoldingOwner      = $HoldingOwner
@@ -475,6 +495,14 @@ WHERE m.name = N'$litUser' ORDER BY r.name;
     foreach ($s in $permStmts) { $rl += $s; $rl += "GO" }
     foreach ($r in $relink)       { $rl += "USE [$(Esc-Ident $r.Database)];"; $rl += "GO"; $rl += $r.Sql; $rl += "GO" }
     foreach ($r in $reassignBack) { $rl += "USE [master];"; $rl += "GO"; $rl += $r.Sql; $rl += "GO" }
+    if ($ownedJobs) {
+        $rl += "USE [msdb];"
+        $rl += "GO"
+        foreach ($j in $ownedJobs) {
+            $rl += "EXEC dbo.sp_update_job @job_id = '$($j.job_id)', @owner_login_name = N'$litLogin';"
+            $rl += "GO"
+        }
+    }
     $rl | Set-Content -Path $recovPath -Encoding UTF8
     Write-Ok "Recovery script: $recovPath"
 
@@ -490,6 +518,7 @@ WHERE m.name = N'$litUser' ORDER BY r.name;
     Write-Host "Re-link users    : $($mappedUsers.Count) across $((@($mappedUsers.Database | Select-Object -Unique)).Count) database(s)"
     foreach ($m in $mappedUsers) { Write-Host "    [$($m.Database)] $($m.User)  (roles: $($(if($m.Roles){$m.Roles -join ', '}else{'none'})))" }
     Write-Host "Owned databases  : $([string]::Join(', ', $ownedDbs))  --> '$HoldingOwner' then back"
+    Write-Host "Owned Agent jobs : $(if ($ownedJobs) { ($ownedJobs | ForEach-Object { $_.job_name }) -join ', ' } else { '(none)' })  --> '$HoldingOwner' then back"
     if ($Bootstrap -and $bootstrapComplete)  { Write-Host "Bootstrap mode   : COMPLETE -- BUILTIN\Administrators sysadmin added; server running normally" -ForegroundColor Green }
     if ($Bootstrap -and (-not $bootstrapComplete)) { Write-Host "Bootstrap mode   : ACTIVE  -- SQL Server is currently running with -m" -ForegroundColor Red }
     Write-Host "--------------------------------------------------------" -ForegroundColor Magenta
@@ -526,6 +555,33 @@ WHERE m.name = N'$litUser' ORDER BY r.name;
     }
 
     # -----------------------------------------------------------------------
+    # PHASE A2: reassign SQL Agent job ownership to holding owner
+    # -----------------------------------------------------------------------
+    $movedJobs = @()
+    if ($ownedJobs) {
+        Write-Step "Reassigning SQL Agent job ownership to '$HoldingOwner'"
+        foreach ($job in $ownedJobs) {
+            try {
+                Invoke-Sql -Query "EXEC msdb.dbo.sp_update_job @job_id = '$($job.job_id)', @owner_login_name = N'$(Esc-Lit $HoldingOwner)';" -NoResult
+                $movedJobs += $job
+                Write-Ok "[$($job.job_name)] owner -> $HoldingOwner"
+            }
+            catch {
+                Write-Warn2 "Failed to reassign job '$($job.job_name)': $($_.Exception.Message). Rolling back all pre-drop changes."
+                foreach ($rb in $movedJobs) {
+                    try { Invoke-Sql -Query "EXEC msdb.dbo.sp_update_job @job_id = '$($rb.job_id)', @owner_login_name = N'$litLogin';" -NoResult; Write-Ok "[$($rb.job_name)] job owner restored" }
+                    catch { Write-Warn2 "ROLLBACK FAILED for job '$($rb.job_name)': $($_.Exception.Message). Fix manually." }
+                }
+                foreach ($rb in $moved) {
+                    try { Invoke-Sql -Query "ALTER AUTHORIZATION ON DATABASE::[$(Esc-Ident $rb)] TO $qLogin;" -NoResult; Write-Ok "[$rb] db owner restored" }
+                    catch { Write-Warn2 "ROLLBACK FAILED for db [$rb]: $($_.Exception.Message). Fix manually." }
+                }
+                throw "Aborted before DROP LOGIN (SQL Agent job ownership reassignment failed)."
+            }
+        }
+    }
+
+    # -----------------------------------------------------------------------
     # PHASE B: drop login  (destructive; recovery .sql is your net from here)
     # -----------------------------------------------------------------------
     Write-Step "Dropping login '$LoginName'"
@@ -546,6 +602,22 @@ WHERE m.name = N'$litUser' ORDER BY r.name;
     if ($disableStmt) { Invoke-Sql -Query $disableStmt -NoResult; Write-Ok "Login DISABLED to match original" }
     foreach ($s in $roleStmts) { Invoke-Sql -Query $s -NoResult; Write-Ok $s }
     foreach ($s in $permStmts) { Invoke-Sql -Query $s -NoResult; Write-Ok $s }
+
+    # Restore SQL Agent job ownership (moved to holding owner in Phase A2)
+    $jobRestoreFailed = @()
+    if ($ownedJobs) {
+        Write-Step "Reassigning SQL Agent job ownership back to '$LoginName'"
+        foreach ($job in $ownedJobs) {
+            try {
+                Invoke-Sql -Query "EXEC msdb.dbo.sp_update_job @job_id = '$($job.job_id)', @owner_login_name = N'$litLogin';" -NoResult
+                Write-Ok "[$($job.job_name)] owner -> $LoginName"
+            }
+            catch {
+                $jobRestoreFailed += $job
+                Write-Warn2 "[$($job.job_name)] job ownership restore FAILED: $($_.Exception.Message)"
+            }
+        }
+    }
 
     # -----------------------------------------------------------------------
     # PHASE D: re-link orphaned database users (preserves their roles/grants)
@@ -592,9 +664,11 @@ WHERE dp.name = N'$litLogin' AND sp.sid IS NULL;
     Write-Host "Old SID -> New   : $oldSid  ->  $newSid"
     Write-Host "Re-linked users  : $($relink.Count - $relinkFailed.Count) / $($relink.Count)"
     Write-Host "Owned dbs back   : $([string]::Join(', ', $ownedDbs))"
+    Write-Host "Agent jobs back  : $($ownedJobs.Count - $jobRestoreFailed.Count) / $($ownedJobs.Count)"
     if ($relinkFailed)     { Write-Host "Re-link FAILURES : $([string]::Join(', ', ($relinkFailed | ForEach-Object { $_.Database })))" -ForegroundColor Yellow }
+    if ($jobRestoreFailed) { Write-Host "Job owner FAILED : $([string]::Join(', ', ($jobRestoreFailed | ForEach-Object { $_.job_name })))" -ForegroundColor Yellow }
     if ($remainingOrphans) { Write-Host "STILL ORPHANED   : $([string]::Join('; ', $remainingOrphans))" -ForegroundColor Yellow }
-    if (-not $relinkFailed -and -not $remainingOrphans) { Write-Host "All users re-linked cleanly." -ForegroundColor Green }
+    if (-not $relinkFailed -and -not $remainingOrphans -and -not $jobRestoreFailed) { Write-Host "All users re-linked and job ownership restored cleanly." -ForegroundColor Green }
     if ($bootstrapComplete) { Write-Host "Bootstrap cleanup: DROP LOGIN [BUILTIN\Administrators];  -- run this once access is confirmed restored" -ForegroundColor Yellow }
     Write-Host "--------------------------------------------------------" -ForegroundColor Green
     Write-Ok "Done."

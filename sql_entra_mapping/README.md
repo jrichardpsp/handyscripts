@@ -8,14 +8,16 @@ Rebuilds a Windows SQL Server login after a **Hybrid AD → Entra ID migration**
 
 When a machine moves from Hybrid AD to Entra ID, the SID for every Windows account changes. SQL Server stores login SIDs at creation time and has no `ALTER LOGIN ... WITH SID` command, so the only fix is to drop and recreate the login. Recreating it causes every database user that was mapped to the old SID to become orphaned. This script handles the full chain automatically:
 
-1. Captures all state (roles, permissions, owned databases, database user mappings)
+1. Captures all state (roles, permissions, owned databases, database user mappings, owned Agent jobs)
 2. Writes a JSON backup and a runnable recovery `.sql` before touching anything
-3. Drops the login
-4. Recreates it from Windows (picks up the new Entra SID automatically)
-5. Restores server roles and explicit permissions
-6. Re-links every orphaned database user with `ALTER USER ... WITH LOGIN` (preserves all role memberships and grants)
-7. Restores database ownership
-8. Verifies no orphans remain
+3. Reassigns owned databases and SQL Agent jobs to a holding owner
+4. Drops the login
+5. Recreates it from Windows (picks up the new Entra SID automatically)
+6. Restores server roles and explicit permissions
+7. Restores SQL Agent job ownership
+8. Re-links every orphaned database user with `ALTER USER ... WITH LOGIN` (preserves all role memberships and grants)
+9. Restores database ownership
+10. Verifies no orphans remain
 
 ---
 
@@ -36,7 +38,7 @@ When a machine moves from Hybrid AD to Entra ID, the SID for every Windows accou
 |---|---|---|
 | `-LoginName` | Current user (`whoami`) | The Windows login to rebuild, e.g. `DOMAIN\username` |
 | `-SqlInstance` | `localhost` | Target SQL Server instance |
-| `-HoldingOwner` | `sa` | Temporary owner for databases during the rebuild |
+| `-HoldingOwner` | `sa` | Temporary owner for databases and Agent jobs during the rebuild |
 | `-DryRun` | — | Scan and print the plan with generated T-SQL. No changes made; backup files are still written |
 | `-Force` | — | Skip the confirmation prompt and bypass the self-rebuild safety check |
 | `-Bootstrap` | Auto-detected | Emergency mode for total lockout — see below |
@@ -135,6 +137,12 @@ START
   ├─[Step 4 — Find owned databases]─────────────────────────────────────────────
   │   READ  sys.databases WHERE owner_sid = @oldSid
   │
+  ├─[Step 4b — Find owned SQL Agent jobs]────────────────────────────────────────
+  │   READ  msdb.dbo.sysjobs JOIN sys.server_principals ON owner_sid = sid
+  │         WHERE login.name = @LoginName
+  │   ► DROP LOGIN fails if any job references the login's SID; jobs must be
+  │     reassigned before the drop and restored after recreation
+  │
   ├─[Step 5 — Write backup files]───────────────────────────────────────────────
   │   Write state_*.json    (full captured state — roles, SID, permissions, mappings)
   │   Write recovery_*.sql  (runnable T-SQL to finish manually if interrupted)
@@ -151,6 +159,12 @@ START
   │   Rollback: on any failure, re-run ALTER AUTHORIZATION back to original login
   │             and abort before DROP LOGIN
   │
+  ├─[Phase A2 — Reassign SQL Agent job ownership to holding owner]───────────────
+  │   For each owned job:
+  │     WRITE  EXEC msdb.dbo.sp_update_job @job_id=..., @owner_login_name=[HoldingOwner]
+  │   Rollback: on any failure, restore both job ownership AND database ownership
+  │             from Phase A, then abort before DROP LOGIN
+  │
   ├─[Phase B — Drop the login] ◄ POINT OF NO RETURN ►──────────────────────────
   │   WRITE  DROP LOGIN [LoginName]
   │          ► All database users mapped to the old SID are now orphaned
@@ -163,6 +177,8 @@ START
   │   WRITE  ALTER LOGIN [LoginName] DISABLE        (if originally disabled)
   │   WRITE  ALTER SERVER ROLE [role] ADD MEMBER [LoginName]   (per captured role)
   │   WRITE  GRANT / DENY [permission] TO [LoginName]          (per captured perm)
+  │   WRITE  EXEC msdb.dbo.sp_update_job @job_id=..., @owner_login_name=[LoginName]
+  │          (per captured job — restores ownership to the rebuilt login)
   │
   ├─[Phase D — Re-link orphaned database users]─────────────────────────────────
   │   For each {Database, User} captured in Step 3:
@@ -195,6 +211,7 @@ START
 | `sys.databases` | Instance | All online databases; databases owned by the login |
 | `sys.database_principals` | Per database | Users whose SID matches the old login SID |
 | `sys.database_role_members` | Per database | Role memberships of matched users (audit only) |
+| `msdb.dbo.sysjobs` | Instance | SQL Agent jobs owned by the login (matched by `owner_sid`) |
 
 ---
 
@@ -202,7 +219,8 @@ START
 
 | Phase | Statement | Purpose |
 |---|---|---|
-| A | `ALTER AUTHORIZATION ON DATABASE::[db] TO [sa]` | Move ownership off the login before dropping it |
+| A | `ALTER AUTHORIZATION ON DATABASE::[db] TO [sa]` | Move database ownership off the login before dropping it |
+| A2 | `EXEC msdb.dbo.sp_update_job @job_id=..., @owner_login_name='sa'` | Move Agent job ownership off the login — `DROP LOGIN` fails if any job references the login's SID |
 | B | `DROP LOGIN [LoginName]` | Remove the stale SID — **point of no return** |
 | C | `CREATE LOGIN [LoginName] FROM WINDOWS WITH DEFAULT_DATABASE=..., DEFAULT_LANGUAGE=...` | Recreate — OS resolves the account to the new Entra SID at this moment |
 | C | `ALTER LOGIN [LoginName] DISABLE` | Restore disabled state if the login was originally disabled |
@@ -210,6 +228,7 @@ START
 | C | `GRANT [permission] TO [LoginName]` | Restore each explicit server permission |
 | C | `GRANT [permission] TO [LoginName] WITH GRANT OPTION` | Restore grant-with-grant permissions |
 | C | `DENY [permission] TO [LoginName]` | Restore each explicit server deny |
+| C | `EXEC msdb.dbo.sp_update_job @job_id=..., @owner_login_name=[LoginName]` | Restore Agent job ownership to the rebuilt login |
 | D | `ALTER USER [user] WITH LOGIN = [LoginName]` | Re-bind the database user to the login's new SID |
 | E | `ALTER AUTHORIZATION ON DATABASE::[db] TO [LoginName]` | Restore database ownership |
 
@@ -266,7 +285,7 @@ All written to `-LogDirectory` (default `%USERPROFILE%\SqlLoginRebuild`), stampe
 | File | Purpose |
 |---|---|
 | `transcript_*.txt` | Full PowerShell transcript of the run |
-| `state_*.json` | Complete captured state — login type, SID, roles, permissions, mapped users, owned databases |
+| `state_*.json` | Complete captured state — login type, SID, roles, permissions, mapped users, owned databases, owned Agent jobs |
 | `recovery_*.sql` | Runnable T-SQL to finish manually if the script is interrupted after `DROP LOGIN` |
 
 The backup and recovery files are written **before any changes are made**.
@@ -284,4 +303,5 @@ The script uses `ALTER USER [name] WITH LOGIN = [name]` — **not** `DROP/CREATE
 - The script refuses to rebuild the login it is currently connected as, unless `-Force` or `-Bootstrap` is used
 - A full state backup and recovery script are always written before any destructive operation
 - Database ownership is reassigned to a holding owner (`sa` by default) before the login is dropped, and restored immediately after recreation
-- If ownership reassignment fails for any database, the script rolls back all ownership changes and aborts before `DROP LOGIN`
+- SQL Agent job ownership is reassigned to the same holding owner before the drop, and restored after recreation — `DROP LOGIN` will fail if any job still references the login's SID
+- If ownership reassignment fails (database or Agent job), the script rolls back all pre-drop changes and aborts before `DROP LOGIN`
