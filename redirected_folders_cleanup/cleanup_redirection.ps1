@@ -39,8 +39,28 @@
 .PARAMETER SkipLogoff
     Skip the logoff step after successful completion.
 
+.PARAMETER SkipGpUpdate
+    Skip the gpupdate /force step.
+
+.PARAMETER ForceCloseApps
+    Skip the app-close dialog entirely. All target applications are closed
+    immediately and silently (graceful close attempt, then kill after 5 seconds).
+    Useful for fully automated / unattended deployments.
+
+.PARAMETER SkipIntro
+    Skip the migration intro dialog when servers are already reachable (on-net
+    or VPN already connected). The script will proceed directly to gpupdate and
+    the app-close step. If servers are unreachable the intro dialog is still
+    shown so the user can connect to VPN.
+
+.PARAMETER MigrationReady
+    Use alternate intro dialog text for a migration software context where the
+    user has already acknowledged and started the migration. Replaces the
+    default IT-team messaging with migration-specific wording.
+
 .PARAMETER AdditionalAppsToClose
-    Additional process names (without .exe) to include in the app-close dialog.
+    Additional process names (without .exe) to include in the app-close dialog
+    or force-close list.
 
 .EXAMPLE
     .\cleanup_redirection.ps1
@@ -73,12 +93,36 @@ param(
     [string]$LogPath = 'C:\ProgramData\Migration',
     [switch]$TestMode,
     [switch]$SkipLogoff,
+    [switch]$SkipGpUpdate,
+    [switch]$ForceCloseApps,
+    [switch]$SkipIntro,
+    [switch]$MigrationReady,
     [int]$WaitForLoginMinutes = 6000,
     [string[]]$AdditionalAppsToClose = @()
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
+
+# ---------------------------------------------------------------------------
+# Customizable intro dialog text
+# Edit these strings to match your organization's messaging.
+# Avoid double quotes (") - use single quotes or omit them entirely.
+# {VPN} in IntroVpnText is substituted at runtime with the -VpnClientName value.
+# ---------------------------------------------------------------------------
+$Script:IntroText1   = 'Your IT team is preparing this computer for an upcoming update. Your files (Desktop, Documents, Pictures, Music, Videos, and Downloads) will be copied from the file server to this computer. This may take several minutes depending on the amount of data stored.'
+$Script:IntroText2   = 'Once complete, you will be asked to log off. When you log back in, your files will be in their usual locations, stored locally on this computer.'
+$Script:IntroVpnText = 'To begin, please connect to {VPN}. This window will continue automatically once the connection is established.'
+
+# ---------------------------------------------------------------------------
+# Alternate intro text used when -MigrationReady is specified.
+# Shown when this script is called from migration software after the user
+# has already acknowledged and started the migration.
+# {VPN} in MRIntroVpnText is substituted at runtime with the -VpnClientName value.
+# ---------------------------------------------------------------------------
+$Script:MRIntroText1   = 'Your migration is now underway. As part of this process, your files (Desktop, Documents, Pictures, Music, Videos, and Downloads) will be copied from the file server to this computer. This may take several minutes depending on the amount of data stored.'
+$Script:MRIntroText2   = 'Once this process is completed your machine will be rebooted to continue the migration. Please wait until your system login screen returns to normal before logging in.'
+$Script:MRIntroVpnText = 'To begin, please connect to {VPN}. This window will continue automatically once the connection is established.'
 
 # ---------------------------------------------------------------------------
 # Script-scope globals
@@ -572,6 +616,68 @@ function Test-ServerConnectivity {
     return $results
 }
 
+function Test-OfflineFilesCached {
+    param(
+        [array]$Redirected,
+        [string[]]$UnreachableServers
+    )
+    # Returns $true if the CSC service is enabled and every source path whose
+    # server is unreachable is accessible via the local Offline Files cache.
+    # The Test-Path calls run in the user's context (CSC is per-user; SYSTEM
+    # cannot access the cache). The registry check is machine-level and runs here.
+
+    # --- CSC service check (machine-level registry, safe to read as SYSTEM) ---
+    $cscKey   = 'HKLM:\SYSTEM\CurrentControlSet\Services\CSC\Parameters'
+    $cscProps = Get-ItemProperty $cscKey -Name 'Start' -ErrorAction SilentlyContinue
+    # Start=4 means explicitly disabled. Absent or any other value = enabled (default).
+    if ($cscProps -and ($cscProps.Start -eq 4)) {
+        Write-Log "  Offline Files (CSC) service is disabled - VPN required"
+        return $false
+    }
+
+    # --- Build list of paths from unreachable servers ---
+    $pathsToTest = @()
+    foreach ($entry in $Redirected) {
+        $server = ($entry.SourcePath.TrimStart('\') -split '\\')[0]
+        if ($UnreachableServers -contains $server) {
+            $pathsToTest += $entry.SourcePath
+        }
+    }
+    if ($pathsToTest.Count -eq 0) { return $false }
+
+    # --- Test paths in user context (CSC redirection only applies to the user session) ---
+    $pathsLiteral = "'" + (($pathsToTest -replace "'", "''") -join "','") + "'"
+
+    $scriptContent = @"
+`$pathsToTest = @($pathsLiteral)
+`$accessible  = 0
+foreach (`$p in `$pathsToTest) {
+    if (Test-Path `$p -ErrorAction SilentlyContinue) {
+        `$accessible++
+    }
+}
+`$allVal = if (`$accessible -eq `$pathsToTest.Count) { 'true' } else { 'false' }
+[System.IO.File]::WriteAllText(`$ResultPath,
+    ('{"AllCached":' + `$allVal + ',"Accessible":' + `$accessible + ',"Total":' + `$pathsToTest.Count + '}'),
+    [System.Text.Encoding]::ASCII)
+exit 0
+"@
+
+    Write-Log "  Running CSC path check in user context ($($pathsToTest.Count) path(s))..."
+    $ipc = Invoke-InUserContext -TaskName 'CscCheck' -ScriptContent $scriptContent -TimeoutSeconds 30
+
+    if (-not $ipc.ResultData) {
+        Write-Log "  CSC check task failed or returned no data - VPN required" -Level WARN
+        return $false
+    }
+
+    $accessible = [int]$ipc.ResultData.Accessible
+    $total      = [int]$ipc.ResultData.Total
+    Write-Log "  CSC cache accessible: $accessible of $total path(s)"
+
+    return ($accessible -eq $total -and $total -gt 0)
+}
+
 
 # ===========================================================================
 # SECTION: User-Context Task Runner
@@ -720,7 +826,8 @@ function Show-MigrationIntroDialog {
         [string[]]$Servers,
         [string]$VpnName,
         [int]$TimeoutMinutes,
-        [bool]$NeedsVpn
+        [bool]$NeedsVpn,
+        [bool]$MigrationReady = $false
     )
     <#
     Shows a WPF dialog explaining the migration to the user.
@@ -736,6 +843,17 @@ function Show-MigrationIntroDialog {
     $serversLiteral  = "'" + ($Servers -join "','") + "'"
     $timeoutSec      = $TimeoutMinutes * 60
     $needsVpnLiteral = if ($NeedsVpn) { '$true' } else { '$false' }
+
+    # Pull configurable text - these expand into the here-string below
+    if ($MigrationReady) {
+        $introText1      = $Script:MRIntroText1
+        $introText2      = $Script:MRIntroText2
+        $vpnInstrTextEsc = ($Script:MRIntroVpnText -replace '\{VPN\}', $VpnName) -replace "'", "''"
+    } else {
+        $introText1      = $Script:IntroText1
+        $introText2      = $Script:IntroText2
+        $vpnInstrTextEsc = ($Script:IntroVpnText -replace '\{VPN\}', $VpnName) -replace "'", "''"
+    }
 
     $scriptContent = @"
 Add-Type -AssemblyName PresentationFramework
@@ -774,9 +892,9 @@ Add-Type -AssemblyName WindowsBase
         <TextBlock Grid.Row="0" FontSize="14" FontWeight="Bold" TextWrapping="Wrap"
                    Text="File Migration" Margin="0,0,0,14"/>
         <TextBlock Grid.Row="1" TextWrapping="Wrap" Margin="0,0,0,10"
-                   Text="Your IT team is preparing this computer for an upcoming update. Your files (Desktop, Documents, Pictures, Music, Videos, and Downloads) will be copied from the file server to this computer. This may take several minutes depending on the amount of data stored."/>
+                   Text="$introText1"/>
         <TextBlock Grid.Row="2" TextWrapping="Wrap" Margin="0,0,0,14"
-                   Text="Once complete, you will be asked to close your open applications and log off. When you log back in, your files will be in their usual locations, stored locally on this computer."/>
+                   Text="$introText2"/>
         <StackPanel Grid.Row="3" x:Name="VpnPanel" Margin="0,0,0,14">
             <TextBlock x:Name="VpnInstructText" TextWrapping="Wrap"
                        FontWeight="SemiBold" Margin="0,0,0,8"/>
@@ -820,7 +938,7 @@ function Test-SmbReachable {
 
 if (`$needsVpn) {
     `$continueBtn.Visibility = [System.Windows.Visibility]::Collapsed
-    `$vpnInstrTxt.Text = "To begin, please connect to `$vpnName. This window will continue automatically once the connection is established."
+    `$vpnInstrTxt.Text = '$vpnInstrTextEsc'
     `$statusTxt.Text   = "Checking connectivity..."
 
     `$script:started = [DateTime]::Now
@@ -1559,8 +1677,9 @@ function Main {
     Write-Log "User:    $($Script:TargetUser.Domain)\$($Script:TargetUser.Username)"
     Write-Log "SID:     $($Script:TargetUser.SID)"
     Write-Log "Profile: $($Script:TargetUser.ProfilePath)"
-    if ($TestMode)  { Write-Log "Mode:    TEST (no registry changes or logoff)" }
-    if ($SkipLogoff){ Write-Log "Logoff:  SKIPPED" }
+    if ($TestMode)        { Write-Log "Mode:    TEST (no registry changes or logoff)" }
+    if ($SkipLogoff)      { Write-Log "Logoff:  SKIPPED" }
+    if ($MigrationReady)  { Write-Log "Context: MigrationReady (called from migration software)" }
     Write-Log "===================================================================="
 
     # --- Read redirected folders ---
@@ -1589,6 +1708,13 @@ function Main {
 
     Write-Log "$($redirected.Count) folder(s) need to be un-redirected"
 
+    # --- Start persistent background window ---
+    # Launched immediately after confirming there is work to do, before connectivity
+    # tests and offline files checks (which can take several seconds). This ensures
+    # the user sees the status window from the very start of the migration process.
+    $bgSignalPath = Join-Path $LogPath "bg-signal-$($Script:TargetUser.Username).tmp"
+    $bgScriptPath = Start-PersistentStatusWindow -SignalPath $bgSignalPath
+
     # --- Discover servers and test connectivity ---
     $servers = @(Get-ServersFromPaths -Redirected $redirected)
     Write-Log "File server(s) referenced: $($servers -join ', ')"
@@ -1596,47 +1722,58 @@ function Main {
     $connectivity = Test-ServerConnectivity -Servers $servers
     $unreachable  = @($connectivity.Keys | Where-Object { -not $connectivity[$_] })
 
-    # --- Start persistent background window (provides visual continuity between dialogs) ---
-    # Launched before the intro dialog so it is running by the time the intro closes.
-    # Topmost=False keeps it behind all modal dialogs; it stays visible during the
-    # ~15-second gpupdate gap and the brief IPC startup gaps between dialogs.
-    $bgSignalPath = Join-Path $LogPath "bg-signal-$($Script:TargetUser.Username).tmp"
-    $bgScriptPath = Start-PersistentStatusWindow -SignalPath $bgSignalPath
+    # --- Check Offline Files cache if any servers are unreachable ---
+    $usingOfflineFiles = $false
+    if ($unreachable.Count -gt 0) {
+        Write-Log "Unreachable server(s): $($unreachable -join ', ') - checking Offline Files (CSC) cache..."
+        if (Test-OfflineFilesCached -Redirected $redirected -UnreachableServers $unreachable) {
+            Write-Log "Offline Files cache available for all unreachable paths - VPN not required"
+            Write-Log "Source: local CSC cache (robocopy reads via transparent CSC redirection)"
+            $usingOfflineFiles = $true
+            $unreachable = @()
+        }
+    }
 
     # --- Migration intro dialog (combined with VPN wait if servers unreachable) ---
     $needsVpn = ($unreachable.Count -gt 0)
-    Write-Log "Showing migration intro dialog (VPN needed: $needsVpn)"
-    $introOutcome = Show-MigrationIntroDialog -Servers $servers -VpnName $VpnClientName `
-                        -TimeoutMinutes $VpnTimeoutMinutes -NeedsVpn $needsVpn
 
-    switch ($introOutcome) {
-        'cancelled' { Write-Log "User cancelled"; return 3 }
-        'timeout'   { Write-Log "VPN wait timed out ($VpnTimeoutMinutes min)"; return 4 }
-        default     {
-            if ($needsVpn) {
-                Write-Log "VPN connected - re-testing connectivity"
-                $connectivity = Test-ServerConnectivity -Servers $servers
-                $unreachable  = @($connectivity.Keys | Where-Object { -not $connectivity[$_] })
-                if ($unreachable.Count -gt 0) {
-                    Write-Log "Servers still unreachable after VPN: $($unreachable -join ', ')" -Level ERROR
-                    return 4
+    if ($SkipIntro -and -not $needsVpn) {
+        Write-Log "SkipIntro: servers reachable - skipping intro dialog"
+    } else {
+        Write-Log "Showing migration intro dialog (VPN needed: $needsVpn)"
+        $introOutcome = Show-MigrationIntroDialog -Servers $servers -VpnName $VpnClientName `
+                            -TimeoutMinutes $VpnTimeoutMinutes -NeedsVpn $needsVpn `
+                            -MigrationReady ([bool]$MigrationReady)
+
+        switch ($introOutcome) {
+            'cancelled' { Write-Log "User cancelled"; return 3 }
+            'timeout'   { Write-Log "VPN wait timed out ($VpnTimeoutMinutes min)"; return 4 }
+            default     {
+                if ($needsVpn) {
+                    Write-Log "VPN connected - re-testing connectivity"
+                    $connectivity = Test-ServerConnectivity -Servers $servers
+                    $unreachable  = @($connectivity.Keys | Where-Object { -not $connectivity[$_] })
+                    if ($unreachable.Count -gt 0) {
+                        Write-Log "Servers still unreachable after VPN: $($unreachable -join ', ')" -Level ERROR
+                        return 4
+                    }
                 }
             }
         }
     }
 
     # --- gpupdate /force ---
-    # Run now that the file server is reachable (VPN connected if needed).
-    # This picks up the FR GPO removal so Group Policy won't re-redirect on
-    # next logon even if something triggers a policy refresh before the user's
-    # FR CSE state is cleared later in this script.
-    Write-Log "Running gpupdate /force to pick up Group Policy changes..."
-    try {
-        $gpProc = Start-Process -FilePath 'gpupdate.exe' -ArgumentList '/force' `
-                      -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
-        Write-Log "gpupdate completed (exit code $($gpProc.ExitCode))"
-    } catch {
-        Write-Log "gpupdate failed (non-fatal): $_" -Level WARN
+    if ($SkipGpUpdate) {
+        Write-Log "SkipGpUpdate: skipping gpupdate /force"
+    } else {
+        Write-Log "Running gpupdate /force to pick up Group Policy changes..."
+        try {
+            $gpProc = Start-Process -FilePath 'gpupdate.exe' -ArgumentList '/force' `
+                          -Wait -PassThru -WindowStyle Hidden -ErrorAction Stop
+            Write-Log "gpupdate completed (exit code $($gpProc.ExitCode))"
+        } catch {
+            Write-Log "gpupdate failed (non-fatal): $_" -Level WARN
+        }
     }
 
     # --- Build app list (default + additional) ---
@@ -1646,19 +1783,47 @@ function Main {
     }
     $appList = @($appList | Sort-Object -Unique)
 
-    # --- App close dialog ---
+    # --- App close ---
     $forceCloseUsed = $false
     $appsKilled     = @()
 
-    $appResult = Show-AppCloseDialog -AppNames $appList
-
-    switch ($appResult.Outcome) {
-        'cancelled'    { Write-Log "User cancelled at app-close dialog"; return 3 }
-        'force_closed' {
-            $forceCloseUsed = $true
-            $appsKilled     = @($appResult.AppsKilled)
+    if ($ForceCloseApps) {
+        Write-Log "ForceCloseApps: closing target applications without prompting"
+        $forceCloseUsed = $true
+        # Graceful close first
+        foreach ($app in $appList) {
+            $procs = @(Get-Process -Name $app -ErrorAction SilentlyContinue)
+            foreach ($p in $procs) {
+                try { $null = $p.CloseMainWindow() } catch { }
+            }
         }
-        'proceed'      { Write-Log "User clicked Continue - all target apps closed" }
+        Start-Sleep -Seconds 5
+        # Kill anything still running
+        foreach ($app in $appList) {
+            $procs = @(Get-Process -Name $app -ErrorAction SilentlyContinue)
+            foreach ($p in $procs) {
+                try {
+                    Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+                    $appsKilled += $app
+                } catch { }
+            }
+        }
+        if ($appsKilled.Count -gt 0) {
+            Write-Log "Force-closed: $($appsKilled -join ', ')"
+        } else {
+            Write-Log "No target applications were running"
+        }
+    } else {
+        $appResult = Show-AppCloseDialog -AppNames $appList
+
+        switch ($appResult.Outcome) {
+            'cancelled'    { Write-Log "User cancelled at app-close dialog"; return 3 }
+            'force_closed' {
+                $forceCloseUsed = $true
+                $appsKilled     = @($appResult.AppsKilled)
+            }
+            'proceed'      { Write-Log "User clicked Continue - all target apps closed" }
+        }
     }
 
     # --- File copy (in user context) ---
@@ -1673,13 +1838,14 @@ function Main {
     if (-not $copyOk) {
         Write-Log "One or more file copies failed - aborting before registry changes" -Level ERROR
         Write-Manifest -Data @{
-            Username       = $Script:TargetUser.Username
-            SID            = $Script:TargetUser.SID
-            ProfilePath    = $Script:TargetUser.ProfilePath
-            Result         = 'copy_failed'
-            ForceCloseUsed = $forceCloseUsed
-            AppsKilled     = $appsKilled
-            Folders        = $redirected
+            Username          = $Script:TargetUser.Username
+            SID               = $Script:TargetUser.SID
+            ProfilePath       = $Script:TargetUser.ProfilePath
+            Result            = 'copy_failed'
+            ForceCloseUsed    = $forceCloseUsed
+            UsingOfflineFiles = $usingOfflineFiles
+            AppsKilled        = $appsKilled
+            Folders           = $redirected
         }
         return 5
     }
@@ -1700,13 +1866,14 @@ function Main {
         if ($regErrors -gt 0) {
             Write-Log "Registry rewrite had $regErrors error(s)" -Level ERROR
             Write-Manifest -Data @{
-                Username       = $Script:TargetUser.Username
-                SID            = $Script:TargetUser.SID
-                ProfilePath    = $Script:TargetUser.ProfilePath
-                Result         = 'registry_failed'
-                ForceCloseUsed = $forceCloseUsed
-                AppsKilled     = $appsKilled
-                Folders        = $redirected
+                Username          = $Script:TargetUser.Username
+                SID               = $Script:TargetUser.SID
+                ProfilePath       = $Script:TargetUser.ProfilePath
+                Result            = 'registry_failed'
+                ForceCloseUsed    = $forceCloseUsed
+                UsingOfflineFiles = $usingOfflineFiles
+                AppsKilled        = $appsKilled
+                Folders           = $redirected
             }
             return 6
         }
@@ -1722,13 +1889,14 @@ function Main {
 
     # --- Write manifest ---
     Write-Manifest -Data @{
-        Username       = $Script:TargetUser.Username
-        SID            = $Script:TargetUser.SID
-        ProfilePath    = $Script:TargetUser.ProfilePath
-        Result         = if ($TestMode) { 'success_testmode' } else { 'success' }
-        ForceCloseUsed = $forceCloseUsed
-        AppsKilled     = $appsKilled
-        Folders        = $redirected
+        Username           = $Script:TargetUser.Username
+        SID                = $Script:TargetUser.SID
+        ProfilePath        = $Script:TargetUser.ProfilePath
+        Result             = if ($TestMode) { 'success_testmode' } else { 'success' }
+        ForceCloseUsed     = $forceCloseUsed
+        UsingOfflineFiles  = $usingOfflineFiles
+        AppsKilled         = $appsKilled
+        Folders            = $redirected
     }
 
     # --- Logoff ---

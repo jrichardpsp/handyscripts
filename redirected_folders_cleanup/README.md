@@ -2,7 +2,7 @@
 
 Reverses Active Directory Folder Redirection for AD-to-Entra (Azure AD Join) migration. Copies the user's redirected folders (Desktop, Documents, Pictures, Music, Videos, Downloads) from their UNC server paths back to the local profile, rewrites the shell folder registry values to local paths, and clears the Group Policy Folder Redirection CSE state.
 
-Designed to run as SYSTEM via RMM (Atera, NinjaOne, etc.) with no manual steps required on the endpoint. Includes a full user-facing GUI that explains the migration, prompts for VPN if needed, closes applications safely, shows copy progress, and logs the user off when complete.
+Designed to run as SYSTEM via RMM (Atera, NinjaOne, etc.) or as a PowerSyncPro startup script, with no manual steps required on the endpoint. Includes a full user-facing GUI that explains the migration, prompts for VPN if needed, closes applications safely, shows copy progress, and logs the user off when complete.
 
 ---
 
@@ -27,7 +27,7 @@ After removing them from scope, allow time for AD replication to complete before
 - **PowerShell 5.1** (Windows 10 / 11 inbox version — no upgrade required)
 - **Windows 10 or Windows 11**
 - No external modules or dependencies
-- The endpoint must be able to reach the file server (SMB, TCP 445) — either on the internal network or via VPN. The script will prompt the user to connect to VPN if the file server is not reachable at launch.
+- The endpoint must be able to reach the file server (SMB, TCP 445) — either on the internal network, via VPN, or via the local Offline Files (CSC) cache (see [Offline Files Support](#offline-files-support) below). The script will prompt the user to connect to VPN if the file server is unreachable and no local cache is available.
 - Run as **SYSTEM** (RMM deployment) or as the **logged-in user** (direct execution)
 
 ---
@@ -51,7 +51,11 @@ If no user is currently logged in when the script runs, it will wait silently in
 | `LogPath` | string | `C:\ProgramData\Migration` | Directory for log files and migration manifest |
 | `TestMode` | switch | off | Runs all steps except registry rewrite, CSE clear, and logoff. Safe for piloting. |
 | `SkipLogoff` | switch | off | Skips the logoff step after successful completion |
-| `AdditionalAppsToClose` | string[] | `@()` | Additional process names (without .exe) to include in the app-close dialog |
+| `SkipGpUpdate` | switch | off | Skips the `gpupdate /force` step. Use when the calling software has already applied policy updates. |
+| `SkipIntro` | switch | off | Skips the intro dialog when servers are already reachable. The intro is still shown if VPN is needed. |
+| `ForceCloseApps` | switch | off | Silently force-closes all target applications without prompting the user. Useful for fully automated deployments. |
+| `MigrationReady` | switch | off | Uses alternate intro dialog text for migration software context. Shows messaging appropriate for a user who has already acknowledged and started the migration (e.g. via PowerSyncPro). |
+| `AdditionalAppsToClose` | string[] | `@()` | Additional process names (without .exe) to include in the app-close dialog or force-close list |
 
 ---
 
@@ -77,6 +81,56 @@ If no user is currently logged in when the script runs, it will wait silently in
 .\cleanup_redirection.ps1 -LogPath 'C:\ProgramData\PSP\Migration'
 ```
 
+**PowerSyncPro migration (recommended):**
+```powershell
+.\cleanup_redirection.ps1 -SkipLogoff -ForceCloseApps -SkipGpUpdate -SkipIntro -MigrationReady
+```
+
+> When called from PowerSyncPro during an AD-to-Entra migration, use this combination. The user has already clicked "Ok, Start Migration" in PowerSyncPro, so the intro dialog is skipped entirely (the user is already on-net or VPN at this point), apps are closed silently without prompting, `gpupdate` is skipped (PowerSyncPro handles policy), logoff is suppressed so PowerSyncPro can manage the reboot and Entra join sequence itself, and `-MigrationReady` ensures any remaining dialogs use migration-specific wording.
+
+---
+
+## Offline Files Support
+
+If Windows Offline Files (CSC) is enabled and the file server is unreachable, the script automatically detects that the redirected folders are available in the local cache and proceeds without requiring VPN. No flags or configuration are needed — detection is fully automatic.
+
+When this path is taken:
+- The VPN connectivity prompt is skipped entirely
+- robocopy reads from the UNC paths as normal — the CSC filter driver transparently serves files from the local cache at the driver level
+- `UsingOfflineFiles: true` is recorded in the migration manifest
+
+**Important caveat:** If there are unsynced changes in the CSC cache (files modified offline that have not yet synced back to the server), those local changes are what gets copied — the server version is not consulted. This is generally the correct behavior for a migration, but if the machine can reach the server, sync should be confirmed complete in Sync Center (`mobsync.exe`) before running the script to avoid any possibility of conflict.
+
+If the server IS reachable when Offline Files is enabled, robocopy reads from the server directly (standard behavior).
+
+---
+
+## Customizing Dialog Text
+
+Near the top of the script, before any functions, there are two labeled text blocks you can edit to match your organization's messaging. No other changes to the script are needed.
+
+**Standard deployment text** — shown when the script is run without `-MigrationReady`:
+
+```powershell
+$Script:IntroText1   = 'Your IT team is preparing this computer...'
+$Script:IntroText2   = 'Once complete, you will be asked to log off...'
+$Script:IntroVpnText = 'To begin, please connect to {VPN}...'
+```
+
+**MigrationReady text** — shown when `-MigrationReady` is used (e.g. called from PowerSyncPro):
+
+```powershell
+$Script:MRIntroText1   = 'Your migration is now underway...'
+$Script:MRIntroText2   = 'Once this process is completed your machine will be rebooted...'
+$Script:MRIntroVpnText = 'To begin, please connect to {VPN}...'
+```
+
+`IntroVpnText` and `MRIntroVpnText` are only shown when the file server is unreachable at launch (VPN not connected). The `{VPN}` placeholder in both VPN strings is replaced at runtime with the value passed to `-VpnClientName`.
+
+**Formatting constraints:**
+- Do not use double quotes (`"`) inside the strings — use single quotes or rephrase.
+- Keep all characters ASCII — no curly quotes, em-dashes, or other Unicode characters. PowerShell 5.1 misreads UTF-8 without BOM and will corrupt non-ASCII text.
+
 ---
 
 ## What the Script Does
@@ -87,9 +141,9 @@ If no user is currently logged in when the script runs, it will wait silently in
 
 3. **Idempotency check** — If all folders are already local, logs "nothing to do" and exits cleanly with code 0.
 
-4. **Tests file server connectivity** — Tests TCP port 445 to each referenced file server.
+4. **Tests file server connectivity** — Tests TCP port 445 to each referenced file server. If any server is unreachable, checks whether the Offline Files (CSC) cache is available for those paths (test runs in the user's session). If the cache covers all unreachable paths, the script proceeds without VPN and robocopy reads from the local cache.
 
-5. **Shows the migration intro dialog** — Explains the migration to the user in plain language. If file servers are unreachable, this dialog also includes a VPN connectivity prompt that auto-proceeds once connectivity is detected.
+5. **Shows the migration intro dialog** — Explains the migration to the user in plain language. If file servers are unreachable and no local cache is available, this dialog includes a VPN connectivity prompt that auto-proceeds once connectivity is detected.
 
 6. **Runs `gpupdate /force`** — Picks up the FR GPO removal so Group Policy will not re-redirect folders on next logon.
 
@@ -107,7 +161,7 @@ If no user is currently logged in when the script runs, it will wait silently in
 
 Throughout execution, a timestamped log is written to `LogPath` (`C:\ProgramData\Migration\unredirect-<username>-<timestamp>.log`). A migration manifest (`unredirect-<username>.json`) is written at the end of each run with the full outcome, folder-level copy results, and any apps that were force-closed.
 
-A persistent "Migration in Progress" banner is displayed from step 5 through step 12 to ensure the user always has visible confirmation that the process is running.
+A persistent "Migration in Progress" banner is displayed from step 3 onward (immediately after confirming there is work to do) through step 12, ensuring the user has visible confirmation throughout the entire process including during connectivity checks and dialog transitions.
 
 ---
 
@@ -128,7 +182,7 @@ All files are written to `LogPath` (`C:\ProgramData\Migration` by default).
 | File | Description |
 |---|---|
 | `unredirect-<username>-<timestamp>.log` | Full execution log with timestamps |
-| `unredirect-<username>.json` | Migration manifest — outcome, folder results, apps killed |
+| `unredirect-<username>.json` | Migration manifest — outcome, folder results, apps killed, `UsingOfflineFiles` flag |
 | `robocopy-<folder>-<timestamp>.log` | Per-folder robocopy log |
 
 The manifest file is overwritten on each run (no timestamp in the filename), so the latest run is always at `unredirect-<username>.json`.
