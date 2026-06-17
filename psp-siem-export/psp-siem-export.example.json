@@ -1,0 +1,32 @@
+{
+  "_readme": "Copy this file to psp-siem-export.json and fill in your values. CLI params override config values.",
+
+  "_connection_notes": [
+    "SQL Express (named instance): HOST\\SQLEXPRESS  -- SQL Browser service must be running for port resolution.",
+    "SQL Express with explicit port (bypasses Browser): HOST\\SQLEXPRESS,52317",
+    "SQL Server default instance: HOSTNAME  (no backslash)",
+    "SQL Server named instance:   HOST\\MSSQLSERVER",
+    "To find the dynamic port on Express: SQL Server Configuration Manager -> Protocols -> TCP/IP -> IP Addresses -> IPAll -> TCP Dynamic Ports"
+  ],
+
+  "SqlInstance":  "YOURHOST\\SQLEXPRESS",
+  "Database":     "PowerSyncProDB",
+
+  "_tenantid_note": "REQUIRED security control -- scopes all queries to one tenant. Never omit.",
+  "TenantId":     1,
+
+  "OutputDir":    "C:\\PSPLogExport\\out",
+  "StateDir":     "C:\\PSPLogExport\\state",
+
+  "_batchsize_note": "Rows per output file. 5000 is a safe default; lower if SIEM has ingestion limits.",
+  "BatchSize":    5000,
+
+  "EventDataset": "powersyncpro.runbooklog",
+
+  "OutputFormat": "ECS",
+
+  "_dedupe_note": "Off by default. Enable only if PSP is configured for multiple concurrent writer processes.",
+  "EnableDedupeWindow":   false,
+  "DedupeWindowMinutes":  10,
+  "DedupeMaxSeenIds":     50000
+}
