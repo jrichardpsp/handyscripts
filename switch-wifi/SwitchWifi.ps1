@@ -49,6 +49,12 @@
 #   - Do NOT use Get-NetConnectionProfile to read the SSID. It returns the AD
 #     domain on domain-authenticated networks, which is every device this
 #     script targets. See Get-WlanInterfaceInfo.
+#   - netsh only reports the SSID when Location services are enabled. The
+#     script enables them itself (SystemSettingsAdminFlows.exe, since the
+#     consent registry value cannot be written directly) and restores the
+#     original state on exit. Set $DoNotRunLocationPrivacyCheck to $true
+#     where another process manages Location on the device. See
+#     Enable-LocationForSsidRead / Restore-LocationConsent.
 #   - The scan is FORCED via WlanScan() (wlanapi.dll). 'netsh wlan show
 #     networks' only reads the adapter's cache, which at startup holds little
 #     more than the connected network. See Get-MigrationNetworkSecurity.
@@ -69,6 +75,16 @@
 #   on the migration network with a new profile installed. That is the point of
 #   it. What it protects is the destructive half, which on an idle machine is
 #   pure damage to repair by hand.
+#
+# Change log:
+#   2026-08-28  Location services are now enabled automatically before the
+#               SSID read and restored to their previous state on every exit
+#               path (via Stop-Logging). New $DoNotRunLocationPrivacyCheck
+#               config flag to skip this where Location is managed elsewhere.
+#               An unreadable SSID is now a Fail-Migration instead of a
+#               silent exit 0, since the script has already tried to fix the
+#               only known cause.
+#   2026-07-17  Initial release.
 # ==========================================================================
 
 param(
@@ -80,6 +96,11 @@ param(
 #
 $CorporateSSID = "CORP"
 $MigrationSSID = "CORP Migration"
+
+# Set to $true when another process (e.g. a separate policy script) already
+# manages Location services on this device; the script will then neither
+# enable nor restore it.
+$DoNotRunLocationPrivacyCheck = $false
 
 #
 # Pre-shared key for the migration network.
@@ -173,6 +194,10 @@ function Write-Log
 #
 function Stop-Logging
 {
+    # Every exit path in this script goes through here, including
+    # Fail-Migration, so this is the one place the restore needs to live.
+    Restore-LocationConsent
+    
     try
     {
         Stop-Transcript | Out-Null
@@ -187,6 +212,119 @@ Write-Log "ATTEMPTING TO CONNECT $env:COMPUTERNAME TO THE MIGRATION WI-FI NETWOR
 if ($DryRun)
 {
     Write-Log "*** DRY RUN: the Wi-Fi switch is real; a halt would only be described, not performed. ***"
+}
+
+
+# --------------------------------------------------------------------------
+# Location services
+# --------------------------------------------------------------------------
+
+$LocationConsentPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location"
+$SysSettingsFlows    = Join-Path $env:SystemRoot "System32\SystemSettingsAdminFlows.exe"
+
+$script:LocationChangedByUs = $false
+$script:LocationRestored    = $false
+
+#
+# Reading the consent value IS reliable; only writing it is not.
+# Anything unreadable is treated as Deny, so we enable it and
+# importantly, restore it to Deny afterwards.
+#
+function Get-LocationConsent
+{
+    try
+    {
+        $v = (Get-ItemProperty -Path $LocationConsentPath -Name Value -ErrorAction Stop).Value
+        if ($v) { return $v }
+    }
+    catch
+    {
+    }
+
+    return "Deny"
+}
+
+function Enable-LocationForSsidRead
+{
+    if ($DoNotRunLocationPrivacyCheck)
+    {
+        Write-Log "Location handling skipped - DoNotRunLocationPrivacyCheck is set."
+        return
+    }
+
+    $original = Get-LocationConsent
+    Write-Log "Location services currently: $original"
+
+    if ($original -eq "Allow")
+    {
+        Write-Log "Location already enabled. Nothing to change, nothing to restore."
+        return
+    }
+
+    if (!(Test-Path $SysSettingsFlows))
+    {
+        Write-Log "WARNING: $SysSettingsFlows not found. Cannot enable Location; the SSID read may fail."
+        return
+    }
+
+    try
+    {
+        # Settings throws a prompt and goes semi-frozen if it is open on the
+        # Location page while this runs. The change applies regardless.
+        taskkill /f /im SystemSettings.exe /t 2>$null | Out-Null
+
+        & $SysSettingsFlows SetCamSystemGlobal location 1
+        Start-Sleep -Seconds 3
+
+        if ((Get-LocationConsent) -eq "Allow")
+        {
+            $script:LocationChangedByUs = $true
+            Write-Log "Location services enabled for the SSID read. Will be restored to '$original' on exit."
+        }
+        else
+        {
+            Write-Log "WARNING: Location still not enabled after SetCamSystemGlobal."
+        }
+    }
+    catch
+    {
+        Write-Log "WARNING: Unable to enable Location services: $($_.Exception.Message)"
+    }
+}
+
+#
+# Restores only what this script changed. Idempotent - called from
+# Stop-Logging, which every exit path goes through.
+#
+function Restore-LocationConsent
+{
+    if (!$script:LocationChangedByUs -or $script:LocationRestored)
+    {
+        return
+    }
+
+    $script:LocationRestored = $true
+
+    if (!(Test-Path $SysSettingsFlows))
+    {
+        Write-Log "WARNING: $SysSettingsFlows not found. Location left ENABLED on this device."
+        return
+    }
+
+    try
+    {
+        taskkill /f /im SystemSettings.exe /t 2>$null | Out-Null
+
+        & $SysSettingsFlows SetCamSystemGlobal location 0
+        Start-Sleep -Seconds 3
+
+        Write-Log "Location services restored to Deny."
+    }
+    catch
+    {
+        Write-Log "WARNING: Unable to restore Location services: $($_.Exception.Message)"
+        Write-Log "WARNING: Location has been left ENABLED on this device."
+    }
 }
 
 # --------------------------------------------------------------------------
@@ -1367,6 +1505,12 @@ if ($WlanSvc.Status -ne 'Running')
 }
 
 #
+# Enable Location before any SSID read - see Enable-LocationForSsidRead.
+#
+Enable-LocationForSsidRead
+
+
+#
 # Wireless interface state
 #
 $Wlan = Get-WlanInterfaceInfo
@@ -1439,14 +1583,7 @@ if (!$Wlan.IsConnected)
 #
 if (!$Wlan.Ssid)
 {
-    Write-Log "WARNING: Wireless adapter is connected but its SSID could not be read."
-    Write-Log "WARNING: netsh requires Location permission to report the SSID; it is"
-    Write-Log "WARNING: granted to SYSTEM but refused to an interactive admin session."
-    Write-Log "WARNING: Cannot determine whether this device is on '$CorporateSSID', so"
-    Write-Log "WARNING: it has NOT been switched. If this appears while running as SYSTEM,"
-    Write-Log "WARNING: check Location services policy on this device."
-    Stop-Logging
-    exit 0
+    Fail-Migration "The wireless adapter is connected but its SSID could not be read. netsh requires Location services, which this script attempted to enable. Without the SSID we cannot tell whether this device is on '$CorporateSSID', so it has NOT been switched - migrating it would strand it."
 }
 
 #

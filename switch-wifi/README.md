@@ -20,6 +20,9 @@ It is designed to run **as SYSTEM**, invoked by the PSP Startup Package.
 2. **Detects the migration network.** Forces a Wi-Fi scan and reads the
    migration SSID's security type (WPA2 vs WPA3) off the air, so nothing about
    the network's security has to be configured by hand.
+   Before that, the script enables Windows **Location services** if they are off,
+   because `netsh` will not report the SSID without them; the original setting
+   is restored on exit.
 3. **Switches to it.** Generates a matching WLAN profile, imports it, sets it to
    top priority and auto-connect, and connects.
 4. **Verifies the switch worked.** Waits for association, then a real DHCP lease,
@@ -40,6 +43,7 @@ All settings are near the top of `SwitchWifi.ps1`.
 | `$CorporateSSID` | The Wi-Fi the device is on *now*. Only devices on this SSID are switched. **This is a gate** — if it is wrong, the script exits without doing anything. |
 | `$MigrationSSID` | The migration network to move onto. |
 | `$MigrationPSK` | Pre-shared key for the migration network. **Must be set** — the script refuses to run while it is still `CHANGE-ME`. 8–63 characters. |
+| `$DoNotRunLocationPrivacyCheck` | Default `$false`. Set to `$true` if another process already manages Location services on the device; the script will then neither enable nor restore them. If Location is off and this is set, the SSID read fails and the migration is halted. |
 | `$PSPServer` / `$PSPPort` | **Fallback only.** At run time the PSP endpoint is read from `HKLM\SOFTWARE\Declaration Software\Migration Agent\URL`. These apply only if that key is missing or unreadable — but keep them pointed at a real server just in case. |
 | `$UserDialogTitle` / `$UserDialogHeading` / `$UserDialogMessage` | The dialog shown to the logged-on user if the migration is halted. Customise freely. |
 
@@ -125,9 +129,10 @@ far leaves the device sitting on the migration network with a new profile
 installed. That is intentional — the point is to protect the destructive rollback
 half, which on an idle machine is just damage to repair by hand.
 
-Run test invocations **as SYSTEM** (e.g. `psexec -s -i powershell.exe`). As an
-interactive admin, `netsh` withholds SSIDs (Location permission) and results will
-not reflect how PSP actually runs the script.
+Run test invocations **as SYSTEM** (e.g. `psexec -s -i powershell.exe`) so
+results reflect how PSP actually runs the script. An elevated interactive
+session will usually work too, since the script enables Location services
+itself, but SYSTEM is the real-world context.
 
 ---
 
@@ -139,6 +144,16 @@ not reflect how PSP actually runs the script.
   translated. `netsh` is used only for the SSID and the scan, matching on
   standards names (`WPA2`, `WPA3`, `CCMP`, `SSID`) that Windows does not
   translate.
+- **Location services are toggled, not assumed.** `netsh` only reports the SSID
+  when Location is enabled. The consent value under
+  `HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\CapabilityAccessManager\ConsentStore\location`
+  can be read reliably but not written, so the script calls
+  `SystemSettingsAdminFlows.exe SetCamSystemGlobal location 1` to enable it and
+  `... 0` to restore it. The restore lives in `Stop-Logging`, which every exit
+  path (including `Fail-Migration`) passes through, and only fires if the script
+  was the one that changed it. If the Settings app is open on the Location page
+  it is killed first, or it hangs. An SSID that still cannot be read after this
+  is treated as a failure and halts the migration.
 - **The scan is forced.** `netsh wlan show networks` only reads the adapter's
   cache, which at startup holds little more than the connected network. The
   script calls `WlanScan()` in `wlanapi.dll` to trigger a fresh scan first.
