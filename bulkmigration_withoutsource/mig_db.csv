@@ -1,0 +1,6 @@
+computer_name,username,source_account_type,target_upn,target_identity
+DEMO-PEAR47,JRR\gwen.stacey,AD,gwen.stacey@migrate2.me,S-1-5-21-2555826666-68284299-3742301699-1110
+DEMO-DINGO74,JRR\peter.parker,AD,peter.parker@migrate2.me,S-1-5-21-2555826666-68284299-3742301699-1109
+DEMO-BUFFALO43,Ironman,Local,tony.stark@migrate2.me,S-1-5-21-2555826666-68284299-3742301699-1106
+DEMO-PEACH65,miles.morales@jrr.me,Entra,miles.morales@migrate2.me,S-1-5-21-2555826666-68284299-3742301699-1107
+DEMO-MANUAL01,Miles,Local,miles.morales@migrate2.me,S-1-5-21-2555826666-68284299-3742301699-1107
