@@ -573,6 +573,37 @@ function Clear-FolderRedirectionState {
 
 
 # ===========================================================================
+# SECTION: Registry - Clear Recycle Bin KnownFolder State
+# ===========================================================================
+
+function Clear-RecycleBinState {
+    param([hashtable]$User)
+    <#
+    Removes per-known-folder Recycle Bin registrations from the user's hive.
+    Folder Redirection gives each redirected known folder its own Recycle Bin
+    ($RECYCLE.BIN on the share) registered under BitBucket\KnownFolder. After
+    un-redirecting, those entries still point at the UNC paths and Explorer
+    shows a 'Recycle Bin on \\server\... is corrupted' prompt at every logon.
+    Deleting the KnownFolder subtree is safe: Explorer rebuilds registrations
+    at next logon, and local folders fall under the per-volume bin instead.
+    #>
+
+    $bbKey = "Registry::HKEY_USERS\$($User.SID)\Software\Microsoft\Windows\CurrentVersion\Explorer\BitBucket\KnownFolder"
+
+    if (Test-Path $bbKey) {
+        try {
+            Remove-Item -Path $bbKey -Recurse -Force -ErrorAction Stop
+            Write-Log "Cleared Recycle Bin KnownFolder state"
+        } catch {
+            Write-Log "Could not clear Recycle Bin KnownFolder state (non-fatal): $_" -Level WARN
+        }
+    } else {
+        Write-Log "No Recycle Bin KnownFolder state found (nothing to clear)"
+    }
+}
+
+
+# ===========================================================================
 # SECTION: Connectivity
 # ===========================================================================
 
@@ -1883,8 +1914,11 @@ function Main {
         # --- Clear FR CSE state ---
         Clear-FolderRedirectionState -User $Script:TargetUser
 
+        # --- Clear stale per-known-folder Recycle Bin registrations ---
+        Clear-RecycleBinState -User $Script:TargetUser
+
     } else {
-        Write-Log "[TESTMODE] Skipping registry rewrite and CSE clear"
+        Write-Log "[TESTMODE] Skipping registry rewrite, CSE clear, and Recycle Bin state clear"
     }
 
     # --- Write manifest ---
