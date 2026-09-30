@@ -573,6 +573,95 @@ function Clear-FolderRedirectionState {
 
 
 # ===========================================================================
+# SECTION: Registry - Remove Stale UNC Shell Folder Values
+# ===========================================================================
+
+function Clear-StaleUncShellFolderValues {
+    param(
+        [hashtable]$User,
+        [array]$Redirected
+    )
+    <#
+    The Folder Redirection CSE writes GUID-named alias values (the ThisPC*
+    known-folder GUIDs, e.g. {754AC886-...} for Desktop) into User Shell
+    Folders alongside the legacy named values. Update-ShellFolderRegistry
+    rewrites only the named values, so the aliases keep pointing at the UNC
+    share. At next logon Explorer sees those aliases, re-registers per-folder
+    Recycle Bins under BitBucket\KnownFolder, and the 'Recycle Bin on
+    \\server\... is corrupted' prompt returns even after the BitBucket clear.
+
+    This sweep enumerates every value in User Shell Folders and Shell Folders
+    and deletes any value whose data still points at a UNC path that was part
+    of this migration (exact match or child of a copied source path). Explorer
+    rebuilds the aliases from the named values at next logon.
+
+    UNC values that do NOT match a copied source path (e.g. a redirected
+    AppData this script does not handle) are left in place and logged as
+    warnings - their data was never copied, so resetting them would orphan it.
+
+    Returns the number of values deleted.
+    #>
+
+    $usfPath = "Registry::HKEY_USERS\$($User.SID)\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"
+    $sfPath  = "Registry::HKEY_USERS\$($User.SID)\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
+
+    $copiedPaths = @()
+    foreach ($entry in $Redirected) {
+        $copiedPaths += $entry.SourcePath.TrimEnd('\')
+    }
+
+    $deleted = 0
+
+    foreach ($regInfo in @(
+        @{ Path = $usfPath; Label = 'USF' },
+        @{ Path = $sfPath;  Label = 'SF'  }
+    )) {
+        $regPath = $regInfo.Path
+        $label   = $regInfo.Label
+
+        if (-not (Test-Path $regPath)) { continue }
+
+        $key = Get-Item -Path $regPath
+        foreach ($name in @($key.GetValueNames())) {
+            if ($name -eq '') { continue }   # default value - never FR data
+
+            # Read raw data without env-var expansion (when running as SYSTEM,
+            # expansion would use SYSTEM's profile, not the target user's)
+            $raw = [string]$key.GetValue($name, '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+            if (-not $raw) { continue }
+
+            $expanded = $raw
+            $expanded = $expanded -replace [regex]::Escape('%USERPROFILE%'), $User.ProfilePath
+            $expanded = $expanded -replace [regex]::Escape('%USERNAME%'),    $User.Username
+
+            if ($expanded -notlike '\\*') { continue }
+
+            $trimmed  = $expanded.TrimEnd('\')
+            $isCopied = $false
+            foreach ($cp in $copiedPaths) {
+                if ($trimmed -eq $cp -or $trimmed -like "$cp\*") { $isCopied = $true; break }
+            }
+
+            if ($isCopied) {
+                try {
+                    Remove-ItemProperty -Path $regPath -Name $name -ErrorAction Stop
+                    Write-Log "  ${label}: removed stale UNC value '$name' ($expanded)"
+                    $deleted++
+                } catch {
+                    Write-Log "  ${label}: could not remove stale UNC value '$name': $_" -Level WARN
+                }
+            } else {
+                Write-Log "  ${label}: UNC value '$name' -> $expanded was not part of this migration - leaving in place" -Level WARN
+            }
+        }
+    }
+
+    Write-Log "Stale UNC shell folder sweep complete ($deleted value(s) removed)"
+    return $deleted
+}
+
+
+# ===========================================================================
 # SECTION: Registry - Clear Recycle Bin KnownFolder State
 # ===========================================================================
 
@@ -1910,6 +1999,13 @@ function Main {
         }
 
         Write-Log "Registry rewrite complete"
+
+        # --- Sweep stale UNC values (FR CSE GUID aliases etc.) ---
+        # Must run before the Recycle Bin clear: any remaining UNC-pointing
+        # shell folder value causes Explorer to re-register per-folder
+        # Recycle Bins at next logon, bringing the corrupted prompt back.
+        Write-Log "Sweeping shell folder keys for stale UNC values"
+        $null = Clear-StaleUncShellFolderValues -User $Script:TargetUser -Redirected $redirected
 
         # --- Clear FR CSE state ---
         Clear-FolderRedirectionState -User $Script:TargetUser
